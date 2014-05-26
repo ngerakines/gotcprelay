@@ -2,57 +2,91 @@ package main
 
 import (
 	"github.com/docopt/docopt.go"
+	"github.com/ngerakines/gotcprelay/common"
 	"log"
 	"net"
-	"os"
+	"time"
 )
 
 const (
 	RECV_BUF_LEN = 1024
 )
 
+type ConnectionPair struct {
+	id   int
+	conn net.Conn
+}
+
 func main() {
 	usage := `echoserver
 
 Usage:
-  echoserver [--listen=<interface> --forward=<destination>]
+  echoserver [--listen=<interface>]
   echoserver -h | --help
   echoserver --version
 
 Options:
   -h --help                Show this screen.
   --version                Show version.
-  --listen=<interface>     Interface to listen on [default: localhost:6666].`
+  --listen=<interface>     Interface to listen on [default: localhost:9998].`
 
 	arguments, _ := docopt.Parse(usage, nil, true, "echoserver v1.0.0", false)
 
-	listenValue, hasListen := arguments["--listen"]
-	listen := "localhost:6666"
-	if hasListen {
-		listenString, isString := listenValue.(string)
-		if isString && len(listenString) > 0 {
-			listen = listenString
-		}
-	}
+	listen := common.ArgOrDefault("--listen", "localhost:9998", arguments)
 
-	listener, err := net.Listen("tcp", listen)
-	if err != nil {
-		log.Fatal("Cannot listen:", err)
-		os.Exit(1)
-	}
-	defer listener.Close()
+	// id to bool (true if has received activity)
+	connections := make(map[int]bool)
+	connectionPairs := make(chan ConnectionPair, 100)
+	connectionActivity := make(chan int, 100)
+	closedConnections := make(chan int, 100)
+
+	lastId := 0
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Fatal("Could not accept connection:", err)
-			os.Exit(2)
+		select {
+		case connection, ok := <-connectionPairs:
+			{
+				if !ok {
+					return
+				}
+				connections[connection.id] = false
+				go echoFunc(connection.conn)
+			}
+		case connection, ok := <-connectionActivity:
+			{
+				if !ok {
+					return
+				}
+				connections[connection] = true
+			}
+		case connection, ok := <-closedConnections:
+			{
+				if !ok {
+					return
+				}
+				delete(connections, connection)
+			}
+		case <-time.After(10 * time.Second):
+			{
+				count := 0
+				for _, hasReceivedData := range connections {
+					if hasReceivedData {
+						count++
+					}
+				}
+				if count == len(connections) {
+					for i := 0; i < 3; i++ {
+						lastId++
+						createConn(listen, lastId, connectionPairs)
+					}
+				}
+			}
 		}
-		go echoFunc(conn)
 	}
 }
 
 func echoFunc(conn net.Conn) {
+	defer conn.Close()
 
 	input := make(chan []byte, 100)
 	go echoInput(conn, input)
@@ -86,4 +120,13 @@ func echoInput(conn net.Conn, input chan []byte) {
 		log.Println("received ", n, " bytes of data =", string(buf))
 		input <- buf
 	}
+}
+
+func createConn(remoteAddress string, id int, connectionPairs chan ConnectionPair) {
+	connection, err := net.Dial("tcp", remoteAddress)
+	if err != nil {
+		log.Fatal("Could not make connection:", err)
+		return
+	}
+	connectionPairs <- ConnectionPair{id, connection}
 }
